@@ -3,7 +3,9 @@ package remote
 import (
 	"encoding/json"
 	"fmt"
+	"regexp"
 	"strings"
+	"sync"
 	"time"
 
 	"vulpineos/internal/juggler"
@@ -23,6 +25,57 @@ type securityProtection struct {
 	Status      string `json:"status"`
 	Details     string `json:"details,omitempty"`
 }
+
+type SecurityScanner struct {
+	mu         sync.Mutex
+	LastScan   *securityScanResult `json:"lastScan,omitempty"`
+	KillSwitch *securityKillResult `json:"killSwitch,omitempty"`
+}
+
+type securityScanResult struct {
+	OK             bool                `json:"ok"`
+	Status         string              `json:"status"`
+	ContextID      string              `json:"contextId,omitempty"`
+	SessionID      string              `json:"sessionId,omitempty"`
+	URL            string              `json:"url,omitempty"`
+	Title          string              `json:"title,omitempty"`
+	RiskScore      float64             `json:"riskScore"`
+	Clean          bool                `json:"clean"`
+	MatchCount     int                 `json:"matchCount"`
+	Matches        []securityScanMatch `json:"matches"`
+	ScannedBytes   int                 `json:"scannedBytes"`
+	Threshold      float64             `json:"threshold"`
+	KillOnRisk     bool                `json:"killOnRisk"`
+	KillSwitch     *securityKillResult `json:"killSwitch,omitempty"`
+	SignatureCount int                 `json:"signatureCount"`
+	ScannedAt      time.Time           `json:"scannedAt"`
+	Error          string              `json:"error,omitempty"`
+}
+
+type securityScanMatch struct {
+	Pattern  string `json:"pattern"`
+	Content  string `json:"content"`
+	Severity int    `json:"severity"`
+	Position int    `json:"position"`
+}
+
+type securityKillResult struct {
+	Activated      bool      `json:"activated"`
+	Reason         string    `json:"reason"`
+	KilledAgents   int       `json:"killedAgents"`
+	BrowserStopped bool      `json:"browserStopped"`
+	TriggeredAt    time.Time `json:"triggeredAt"`
+	Error          string    `json:"error,omitempty"`
+}
+
+type securityPageSnapshot struct {
+	URL   string `json:"url"`
+	Title string `json:"title"`
+	Text  string `json:"text"`
+	HTML  string `json:"html"`
+}
+
+var securitySnippetSecretPattern = regexp.MustCompile(`(?i)\b(api[_-]?key|apikey|token|access[_-]?token|access[_-]?key|secret|password|credential|authorization|cookie|session)\s*[=:]\s*[^,\s;'"<>]+`)
 
 func (api *PanelAPI) scriptsRun(params json.RawMessage) (json.RawMessage, error) {
 	if api.Client == nil {
@@ -77,6 +130,7 @@ func (api *PanelAPI) securityStatus() (json.RawMessage, error) {
 	securityEnabled := api.Orchestrator != nil && api.Orchestrator.SecurityEnabled
 	signatureDB := security.NewSignatureDB()
 	sandbox := security.NewSandbox()
+	scanner := api.securityScanner().Snapshot()
 
 	protections := []securityProtection{
 		{
@@ -112,7 +166,7 @@ func (api *PanelAPI) securityStatus() (json.RawMessage, error) {
 			Name:        "Injection Signature Scanner",
 			Description: "Scans page text for known prompt-injection patterns.",
 			Status:      "available",
-			Details:     fmt.Sprintf("%d signatures loaded; not yet wired into automatic page scans.", signatureDB.Count()),
+			Details:     fmt.Sprintf("%d signatures loaded; manual panel scanner available.", signatureDB.Count()),
 		},
 		{
 			Key:         "sandbox",
@@ -135,8 +189,217 @@ func (api *PanelAPI) securityStatus() (json.RawMessage, error) {
 		"securityEnabled":       securityEnabled,
 		"signaturePatternCount": signatureDB.Count(),
 		"sandboxBlockedAPIs":    sandbox.BlockedAPIs(),
+		"scanner":               scanner,
 		"protections":           protections,
 	})
+}
+
+func (api *PanelAPI) securityScan(params json.RawMessage) (json.RawMessage, error) {
+	if api.Client == nil {
+		return nil, fmt.Errorf("juggler client not available")
+	}
+	var p struct {
+		ContextID  string  `json:"contextId"`
+		KillOnRisk bool    `json:"killOnRisk"`
+		Threshold  float64 `json:"threshold"`
+	}
+	if len(params) > 0 {
+		if err := json.Unmarshal(params, &p); err != nil {
+			return nil, fmt.Errorf("invalid params: %w", err)
+		}
+	}
+	if p.Threshold <= 0 {
+		p.Threshold = 0.7
+	} else if p.Threshold > 1 {
+		p.Threshold = 1
+	}
+
+	contextID, sessionID, err := api.ensureScriptSession(p.ContextID)
+	if err != nil {
+		return nil, err
+	}
+	page, err := api.readSecurityScanPage(sessionID)
+	if err != nil {
+		return nil, err
+	}
+
+	db := security.NewSignatureDB()
+	scanned := page.HTML
+	if page.Text != "" {
+		scanned += "\n" + page.Text
+	}
+	result := db.ScanPage(scanned)
+	out := securityScanResult{
+		OK:             true,
+		ContextID:      contextID,
+		SessionID:      sessionID,
+		URL:            redactPanelURLSecrets(page.URL),
+		Title:          truncateSecuritySnippet(page.Title, 120),
+		RiskScore:      result.RiskScore,
+		Clean:          result.Clean,
+		MatchCount:     len(result.Matches),
+		Matches:        sanitizeSecurityMatches(result.Matches, 25),
+		ScannedBytes:   len(scanned),
+		Threshold:      p.Threshold,
+		KillOnRisk:     p.KillOnRisk,
+		SignatureCount: db.Count(),
+		ScannedAt:      time.Now().UTC(),
+		Status:         securityScanStatus(result.Clean, result.RiskScore),
+	}
+	if p.KillOnRisk && !result.Clean && result.RiskScore >= p.Threshold {
+		kill := api.triggerSecurityKillSwitch(fmt.Sprintf("scanner risk %.2f met threshold %.2f", result.RiskScore, p.Threshold))
+		out.KillSwitch = &kill
+	}
+	api.securityScanner().SetLastScan(out)
+	return json.Marshal(out)
+}
+
+func (api *PanelAPI) securityKillSwitch(params json.RawMessage) (json.RawMessage, error) {
+	var p struct {
+		Reason string `json:"reason"`
+	}
+	if len(params) > 0 {
+		if err := json.Unmarshal(params, &p); err != nil {
+			return nil, fmt.Errorf("invalid params: %w", err)
+		}
+	}
+	result := api.triggerSecurityKillSwitch(p.Reason)
+	return json.Marshal(result)
+}
+
+func (api *PanelAPI) readSecurityScanPage(sessionID string) (securityPageSnapshot, error) {
+	expr := `(function() {
+  var root = document.documentElement;
+  var body = document.body;
+  return JSON.stringify({
+    url: String(location.href || ''),
+    title: String(document.title || ''),
+    text: String(body ? (body.innerText || body.textContent || '') : '').slice(0, 65536),
+    html: String(root ? root.outerHTML : '').slice(0, 131072)
+  });
+})()`
+	raw, err := api.Client.Call(sessionID, "Runtime.evaluate", map[string]interface{}{
+		"expression":    expr,
+		"returnByValue": true,
+	})
+	if err != nil {
+		return securityPageSnapshot{}, fmt.Errorf("scan page: %w", err)
+	}
+	var evalResult struct {
+		Result struct {
+			Value json.RawMessage `json:"value"`
+		} `json:"result"`
+	}
+	if err := json.Unmarshal(raw, &evalResult); err != nil {
+		return securityPageSnapshot{}, fmt.Errorf("parse scan page result: %w", err)
+	}
+	var jsonStr string
+	if err := json.Unmarshal(evalResult.Result.Value, &jsonStr); err != nil {
+		return securityPageSnapshot{}, fmt.Errorf("parse scan page value: %w", err)
+	}
+	var page securityPageSnapshot
+	if err := json.Unmarshal([]byte(jsonStr), &page); err != nil {
+		return securityPageSnapshot{}, fmt.Errorf("parse scan page payload: %w", err)
+	}
+	return page, nil
+}
+
+func (api *PanelAPI) triggerSecurityKillSwitch(reason string) securityKillResult {
+	reason = truncateSecuritySnippet(strings.TrimSpace(reason), 240)
+	if reason == "" {
+		reason = "manual security kill switch"
+	}
+	result := securityKillResult{
+		Activated:   true,
+		Reason:      reason,
+		TriggeredAt: time.Now().UTC(),
+	}
+	if api.Orchestrator != nil && api.Orchestrator.Agents != nil {
+		result.KilledAgents = api.Orchestrator.Agents.Count()
+		api.Orchestrator.Agents.KillAll()
+	}
+	if api.Kernel != nil && api.Kernel.Running() {
+		if err := api.Kernel.Stop(); err != nil {
+			result.Error = err.Error()
+		} else {
+			result.BrowserStopped = true
+		}
+	}
+	api.securityScanner().SetKillSwitch(result)
+	return result
+}
+
+func (api *PanelAPI) securityScanner() *SecurityScanner {
+	if api.Security == nil {
+		api.Security = &SecurityScanner{}
+	}
+	return api.Security
+}
+
+func (s *SecurityScanner) Snapshot() SecurityScanner {
+	if s == nil {
+		return SecurityScanner{}
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := SecurityScanner{}
+	if s.LastScan != nil {
+		scan := *s.LastScan
+		scan.Matches = append([]securityScanMatch(nil), s.LastScan.Matches...)
+		out.LastScan = &scan
+	}
+	if s.KillSwitch != nil {
+		kill := *s.KillSwitch
+		out.KillSwitch = &kill
+	}
+	return out
+}
+
+func (s *SecurityScanner) SetLastScan(scan securityScanResult) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.LastScan = &scan
+}
+
+func (s *SecurityScanner) SetKillSwitch(kill securityKillResult) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.KillSwitch = &kill
+}
+
+func sanitizeSecurityMatches(matches []security.Match, limit int) []securityScanMatch {
+	if len(matches) > limit {
+		matches = matches[:limit]
+	}
+	out := make([]securityScanMatch, len(matches))
+	for i, match := range matches {
+		out[i] = securityScanMatch{
+			Pattern:  match.Pattern,
+			Content:  truncateSecuritySnippet(match.Content, 140),
+			Severity: match.Severity,
+			Position: match.Position,
+		}
+	}
+	return out
+}
+
+func truncateSecuritySnippet(value string, limit int) string {
+	value = redactPanelURLSecrets(value)
+	value = securitySnippetSecretPattern.ReplaceAllString(value, "$1=[redacted]")
+	if len(value) <= limit {
+		return value
+	}
+	return value[:limit]
+}
+
+func securityScanStatus(clean bool, risk float64) string {
+	if clean {
+		return "clean"
+	}
+	if risk >= 0.7 {
+		return "critical"
+	}
+	return "warning"
 }
 
 func (api *PanelAPI) ensureScriptSession(contextID string) (string, string, error) {

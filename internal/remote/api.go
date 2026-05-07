@@ -45,6 +45,7 @@ type PanelAPI struct {
 	Client       *juggler.Client
 	Contexts     *ContextRegistry
 	RuntimeAudit *runtimeaudit.Manager
+	Security     *SecurityScanner
 }
 
 const (
@@ -163,6 +164,10 @@ func (api *PanelAPI) HandleMessage(method string, params json.RawMessage) (json.
 	// --- Security ---
 	case "security.status":
 		return api.securityStatus()
+	case "security.scan":
+		return api.securityScan(params)
+	case "security.killSwitch":
+		return api.securityKillSwitch(params)
 
 	// --- Status ---
 	case "status.get":
