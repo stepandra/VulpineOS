@@ -183,14 +183,14 @@ func TestPrintPanelAccessGeneratedKey(t *testing.T) {
 	for _, want := range []string{
 		"Listening on: 0.0.0.0:8443",
 		"Panel URL: https://localhost:8443/",
-		"API key: secret (generated)",
+		"API key: configured (generated; hidden)",
 	} {
 		if !strings.Contains(out, want) {
 			t.Fatalf("printPanelAccess output %q missing %q", out, want)
 		}
 	}
-	if strings.Contains(out, "?token=secret") {
-		t.Fatalf("generated-key output leaked token URL: %q", out)
+	if strings.Contains(out, "secret") || strings.Contains(out, "?token=secret") {
+		t.Fatalf("generated-key output leaked token: %q", out)
 	}
 }
 
@@ -214,11 +214,14 @@ func TestPrintPanelAccessExplicitKeyAvoidsTokenURL(t *testing.T) {
 	}
 	for _, want := range []string{
 		"Panel URL: http://127.0.0.1:8443/",
-		"API key: secret",
+		"API key: configured (hidden)",
 	} {
 		if !strings.Contains(out, want) {
 			t.Fatalf("printPanelAccess output %q missing %q", out, want)
 		}
+	}
+	if strings.Contains(out, "secret") {
+		t.Fatalf("explicit-key output leaked token: %q", out)
 	}
 }
 

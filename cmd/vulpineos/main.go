@@ -614,9 +614,9 @@ func printPanelAccess(host string, port int, useTLS bool, apiKey string, generat
 	}
 	fmt.Fprintf(stdout, "Panel URL: %s\n", displayURL)
 	if generated {
-		fmt.Fprintf(stdout, "API key: %s (generated)\n", apiKey)
+		fmt.Fprintln(stdout, "API key: configured (generated; hidden)")
 	} else if strings.TrimSpace(apiKey) != "" {
-		fmt.Fprintf(stdout, "API key: %s\n", apiKey)
+		fmt.Fprintln(stdout, "API key: configured (hidden)")
 	}
 	return panelURL
 }
