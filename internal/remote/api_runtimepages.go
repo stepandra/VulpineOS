@@ -280,7 +280,7 @@ func (api *PanelAPI) readSecurityScanPage(sessionID string) (securityPageSnapsho
 		"maxChars": 200,
 	})
 	if err != nil {
-		return securityPageSnapshot{}, fmt.Errorf("scan page: %w", err)
+		return api.readSecurityScanAXTree(sessionID)
 	}
 	var domResult struct {
 		Snapshot  optimizedDOMSnapshot `json:"snapshot"`
@@ -299,6 +299,17 @@ func (api *PanelAPI) readSecurityScanPage(sessionID string) (securityPageSnapsho
 		Title: snapshot.Title,
 		Text:  string(snapshot.Nodes),
 		HTML:  string(raw),
+	}, nil
+}
+
+func (api *PanelAPI) readSecurityScanAXTree(sessionID string) (securityPageSnapshot, error) {
+	raw, err := api.Client.Call(sessionID, "Accessibility.getFullAXTree", map[string]interface{}{})
+	if err != nil {
+		return securityPageSnapshot{}, fmt.Errorf("scan page: %w", err)
+	}
+	return securityPageSnapshot{
+		Text: string(raw),
+		HTML: string(raw),
 	}, nil
 }
 
