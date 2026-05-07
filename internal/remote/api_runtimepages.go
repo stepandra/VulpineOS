@@ -75,6 +75,12 @@ type securityPageSnapshot struct {
 	HTML  string `json:"html"`
 }
 
+type optimizedDOMSnapshot struct {
+	Title string          `json:"title"`
+	URL   string          `json:"url"`
+	Nodes json.RawMessage `json:"nodes"`
+}
+
 var securitySnippetSecretPattern = regexp.MustCompile(`(?i)\b(api[_-]?key|apikey|token|access[_-]?token|access[_-]?key|secret|password|credential|authorization|cookie|session)\s*[=:]\s*[^,\s;'"<>]+`)
 
 func (api *PanelAPI) scriptsRun(params json.RawMessage) (json.RawMessage, error) {
@@ -268,40 +274,32 @@ func (api *PanelAPI) securityKillSwitch(params json.RawMessage) (json.RawMessage
 }
 
 func (api *PanelAPI) readSecurityScanPage(sessionID string) (securityPageSnapshot, error) {
-	expr := `(function() {
-  var root = document.documentElement;
-  var body = document.body;
-  return JSON.stringify({
-    url: String(location.href || ''),
-    title: String(document.title || ''),
-    text: String(body ? (body.innerText || body.textContent || '') : '').slice(0, 65536),
-    html: String(root ? root.outerHTML : '').slice(0, 131072)
-  });
-})()`
-	raw, err := api.Client.Call(sessionID, "Runtime.evaluate", map[string]interface{}{
-		"expression":    expr,
-		"returnByValue": true,
+	raw, err := api.Client.Call(sessionID, "Page.getOptimizedDOM", map[string]interface{}{
+		"maxDepth": 12,
+		"maxNodes": 500,
+		"maxChars": 200,
 	})
 	if err != nil {
 		return securityPageSnapshot{}, fmt.Errorf("scan page: %w", err)
 	}
-	var evalResult struct {
-		Result struct {
-			Value json.RawMessage `json:"value"`
-		} `json:"result"`
+	var domResult struct {
+		Snapshot  optimizedDOMSnapshot `json:"snapshot"`
+		Result    optimizedDOMSnapshot `json:"result"`
+		Truncated bool                 `json:"truncated"`
 	}
-	if err := json.Unmarshal(raw, &evalResult); err != nil {
+	if err := json.Unmarshal(raw, &domResult); err != nil {
 		return securityPageSnapshot{}, fmt.Errorf("parse scan page result: %w", err)
 	}
-	var jsonStr string
-	if err := json.Unmarshal(evalResult.Result.Value, &jsonStr); err != nil {
-		return securityPageSnapshot{}, fmt.Errorf("parse scan page value: %w", err)
+	snapshot := domResult.Snapshot
+	if snapshot.URL == "" && snapshot.Title == "" && len(snapshot.Nodes) == 0 {
+		snapshot = domResult.Result
 	}
-	var page securityPageSnapshot
-	if err := json.Unmarshal([]byte(jsonStr), &page); err != nil {
-		return securityPageSnapshot{}, fmt.Errorf("parse scan page payload: %w", err)
-	}
-	return page, nil
+	return securityPageSnapshot{
+		URL:   snapshot.URL,
+		Title: snapshot.Title,
+		Text:  string(snapshot.Nodes),
+		HTML:  string(raw),
+	}, nil
 }
 
 func (api *PanelAPI) triggerSecurityKillSwitch(reason string) securityKillResult {
