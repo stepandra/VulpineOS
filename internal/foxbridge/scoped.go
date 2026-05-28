@@ -54,7 +54,7 @@ func (b *scopedBackend) Call(sessionID, method string, params json.RawMessage) (
 		if err != nil {
 			return nil, err
 		}
-		return b.client.Call(sessionID, method, withContext)
+		return b.normalizeCall(sessionID, method, withContext)
 	case "Browser.close":
 		return nil, fmt.Errorf("%s is blocked for scoped foxbridge sessions", method)
 	default:
@@ -63,7 +63,7 @@ func (b *scopedBackend) Call(sessionID, method string, params json.RawMessage) (
 			if err != nil {
 				return nil, err
 			}
-			return b.client.Call(sessionID, method, withContext)
+			return b.normalizeCall(sessionID, method, withContext)
 		}
 		if _, ok := safeGlobalBrowserMethods[method]; ok {
 			return b.client.Call(sessionID, method, params)
@@ -84,8 +84,16 @@ func (b *scopedBackend) Call(sessionID, method string, params json.RawMessage) (
 		if err := b.validateSession(method, sessionID); err != nil {
 			return nil, err
 		}
-		return b.client.Call(sessionID, method, params)
+		return b.normalizeCall(sessionID, method, params)
 	}
+}
+
+func (b *scopedBackend) normalizeCall(sessionID, method string, params json.RawMessage) (json.RawMessage, error) {
+	result, err := b.client.Call(sessionID, method, params)
+	if err != nil {
+		return nil, err
+	}
+	return normalizeAccessibilityResult(method, result)
 }
 
 func (b *scopedBackend) Subscribe(event string, handler backend.EventHandler) {

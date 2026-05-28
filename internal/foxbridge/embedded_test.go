@@ -198,6 +198,70 @@ func TestJugglerAdapterClose(t *testing.T) {
 	}
 }
 
+func TestJugglerAdapterNormalizesAccessibilityTree(t *testing.T) {
+	transport := testutil.NewFakeJugglerTransport(t)
+	transport.RespondJSON(accessibilityGetFullAXTree, map[string]any{
+		"tree": map[string]any{
+			"role": "document",
+			"name": "Example",
+			"children": []any{
+				map[string]any{"nodeId": "button-1", "role": "button", "name": "Continue"},
+			},
+		},
+		"filtered": true,
+	})
+	client := juggler.NewClient(transport)
+	defer client.Close()
+
+	adapter := &jugglerAdapter{client: client}
+	result, err := adapter.Call("session-1", accessibilityGetFullAXTree, nil)
+	if err != nil {
+		t.Fatalf("adapter.Call: %v", err)
+	}
+
+	var out map[string]any
+	if err := json.Unmarshal(result, &out); err != nil {
+		t.Fatalf("unmarshal normalized result: %v", err)
+	}
+	nodes := requireNodes(t, out, 2)
+	if _, hasTree := out["tree"]; hasTree {
+		t.Fatal("adapter returned raw tree instead of CDP nodes")
+	}
+	if valueOfAXValue(t, nodes[1]["name"]) != "Continue" {
+		t.Fatalf("button name = %#v", nodes[1]["name"])
+	}
+	if out["filtered"] != true {
+		t.Fatalf("filtered = %#v, want true", out["filtered"])
+	}
+}
+
+func TestScopedBackendNormalizesAccessibilityTree(t *testing.T) {
+	transport := testutil.NewFakeJugglerTransport(t)
+	transport.RespondJSON(accessibilityGetFullAXTree, map[string]any{
+		"tree": map[string]any{
+			"role": "document",
+			"name": "Scoped",
+		},
+	})
+	client := juggler.NewClient(transport)
+	defer client.Close()
+
+	backend := newScopedBackend(client, "context-1")
+	result, err := backend.Call("", accessibilityGetFullAXTree, nil)
+	if err != nil {
+		t.Fatalf("backend.Call: %v", err)
+	}
+
+	var out map[string]any
+	if err := json.Unmarshal(result, &out); err != nil {
+		t.Fatalf("unmarshal normalized result: %v", err)
+	}
+	nodes := requireNodes(t, out, 1)
+	if valueOfAXValue(t, nodes[0]["role"]) != "document" {
+		t.Fatalf("root role = %#v", nodes[0]["role"])
+	}
+}
+
 func TestJugglerAdapterSuppressesDuplicateAttachedTargets(t *testing.T) {
 	transport := testutil.NewFakeJugglerTransport(t)
 	client := juggler.NewClient(transport)

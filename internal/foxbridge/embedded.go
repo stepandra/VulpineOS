@@ -34,7 +34,11 @@ var _ backend.Backend = (*jugglerAdapter)(nil)
 
 func (a *jugglerAdapter) Call(sessionID, method string, params json.RawMessage) (json.RawMessage, error) {
 	// Pass json.RawMessage directly as interface{} — VulpineOS's client marshals it correctly.
-	return a.client.Call(sessionID, method, params)
+	result, err := a.client.Call(sessionID, method, params)
+	if err != nil {
+		return nil, err
+	}
+	return normalizeAccessibilityResult(method, result)
 }
 
 func (a *jugglerAdapter) Subscribe(event string, handler backend.EventHandler) {

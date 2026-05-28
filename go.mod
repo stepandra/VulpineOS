@@ -2,6 +2,8 @@ module vulpineos
 
 go 1.26.1
 
+replace github.com/VulpineOS/foxbridge => ./third_party/foxbridge
+
 require (
 	github.com/VulpineOS/foxbridge v0.1.2-0.20260429081009-86aa95f27df5
 	github.com/VulpineOS/mobilebridge v0.1.0
