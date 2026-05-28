@@ -2,11 +2,27 @@ package bridge
 
 import (
 	"encoding/json"
+	"reflect"
 	"strings"
 	"testing"
 
 	"github.com/VulpineOS/foxbridge/pkg/cdp"
 )
+
+func assertJSONEqual(t *testing.T, got, want json.RawMessage) {
+	t.Helper()
+	var gotValue interface{}
+	var wantValue interface{}
+	if err := json.Unmarshal(got, &gotValue); err != nil {
+		t.Fatalf("unmarshal got %s: %v", string(got), err)
+	}
+	if err := json.Unmarshal(want, &wantValue); err != nil {
+		t.Fatalf("unmarshal want %s: %v", string(want), err)
+	}
+	if !reflect.DeepEqual(gotValue, wantValue) {
+		t.Fatalf("got %s, want %s", string(got), string(want))
+	}
+}
 
 func TestHandleRuntime_Enable(t *testing.T) {
 	b, _ := newTestBridge()
@@ -59,6 +75,28 @@ func TestHandleRuntime_Evaluate_Basic(t *testing.T) {
 	}
 	if p["returnByValue"] != true {
 		t.Errorf("returnByValue = %v, want true", p["returnByValue"])
+	}
+}
+
+func TestNormalizeRuntimeEvaluateResultAddsCDPRemoteObjectTypes(t *testing.T) {
+	tests := []struct {
+		name  string
+		input string
+		want  string
+	}{
+		{name: "string result", input: `{"result":{"value":"Example Domain"}}`, want: `{"result":{"type":"string","value":"Example Domain"}}`},
+		{name: "number result", input: `{"result":{"value":123}}`, want: `{"result":{"type":"number","value":123}}`},
+		{name: "boolean result", input: `{"result":{"value":true}}`, want: `{"result":{"type":"boolean","value":true}}`},
+		{name: "null result", input: `{"result":{"value":null}}`, want: `{"result":{"subtype":"null","type":"object","value":null}}`},
+		{name: "unserializable result", input: `{"result":{"unserializableValue":"NaN"}}`, want: `{"result":{"type":"number","unserializableValue":"NaN"}}`},
+		{name: "object handle", input: `{"result":{"objectId":"obj-1","subtype":"node"}}`, want: `{"result":{"objectId":"obj-1","subtype":"node","type":"object"}}`},
+		{name: "bare value", input: `{"value":"Example Domain"}`, want: `{"result":{"type":"string","value":"Example Domain"}}`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := normalizeRuntimeEvaluateResult(json.RawMessage(tt.input))
+			assertJSONEqual(t, got, json.RawMessage(tt.want))
+		})
 	}
 }
 
@@ -329,7 +367,7 @@ func TestHandleRuntime_ReleaseObject(t *testing.T) {
 
 func TestHandleRuntime_GetProperties(t *testing.T) {
 	b, mb := newTestBridge()
-	mb.SetResponse("", "Runtime.getObjectProperties", json.RawMessage(`{"properties":[{"name":"x","value":{"type":"number"}}]}`), nil)
+	mb.SetResponse("", "Runtime.getObjectProperties", json.RawMessage(`{"properties":[{"name":"x","value":{"value":42}}]}`), nil)
 
 	msg := &cdp.Message{
 		ID:     1,

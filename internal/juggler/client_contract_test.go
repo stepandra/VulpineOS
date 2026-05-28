@@ -74,8 +74,11 @@ func TestClientCallReturnsProtocolError(t *testing.T) {
 	go func() {
 		req := <-mt.outgoing
 		mt.incoming <- &Message{
-			ID:    req.ID,
-			Error: &Error{Message: "no such browser instance"},
+			ID: req.ID,
+			Error: &Error{
+				Message: "no such browser instance",
+				Code:    "ERR_RUNTIME_CONTEXT_TIMEOUT",
+			},
 		}
 	}()
 
@@ -85,5 +88,12 @@ func TestClientCallReturnsProtocolError(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "no such browser instance") {
 		t.Fatalf("error = %q, want to contain %q", err.Error(), "no such browser instance")
+	}
+	protocolErr, ok := err.(*Error)
+	if !ok {
+		t.Fatalf("error type = %T, want *Error", err)
+	}
+	if protocolErr.Code != "ERR_RUNTIME_CONTEXT_TIMEOUT" {
+		t.Fatalf("error code = %q, want ERR_RUNTIME_CONTEXT_TIMEOUT", protocolErr.Code)
 	}
 }

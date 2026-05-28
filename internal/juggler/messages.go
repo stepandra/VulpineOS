@@ -6,17 +6,18 @@ import "encoding/json"
 // Requests have ID+Method+Params, responses have ID+Result/Error,
 // events have Method+Params (no ID).
 type Message struct {
-	ID        int              `json:"id,omitempty"`
-	Method    string           `json:"method,omitempty"`
-	Params    json.RawMessage  `json:"params,omitempty"`
-	Result    json.RawMessage  `json:"result,omitempty"`
-	Error     *Error           `json:"error,omitempty"`
-	SessionID string           `json:"sessionId,omitempty"`
+	ID        int             `json:"id,omitempty"`
+	Method    string          `json:"method,omitempty"`
+	Params    json.RawMessage `json:"params,omitempty"`
+	Result    json.RawMessage `json:"result,omitempty"`
+	Error     *Error          `json:"error,omitempty"`
+	SessionID string          `json:"sessionId,omitempty"`
 }
 
 type Error struct {
 	Message string `json:"message"`
 	Data    string `json:"data,omitempty"`
+	Code    string `json:"code,omitempty"`
 }
 
 func (e *Error) Error() string {

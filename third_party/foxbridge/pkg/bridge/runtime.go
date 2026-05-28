@@ -22,21 +22,49 @@ func normalizeRuntimeEvaluateResult(result json.RawMessage) json.RawMessage {
 	}
 	if rawResult, ok := payload["result"]; ok {
 		if resultObject, ok := rawResult.(map[string]interface{}); ok {
-			if _, hasType := resultObject["type"]; !hasType {
-				resultObject["type"] = inferRuntimeRemoteObjectType(resultObject["value"])
-				return mustMarshal(payload)
-			}
+			normalizeRuntimeRemoteObject(resultObject)
+			return mustMarshal(payload)
 		}
 		return result
 	}
+	normalizeRuntimeRemoteObject(payload)
 	if _, hasType := payload["type"]; hasType {
 		return mustMarshal(map[string]interface{}{"result": payload})
 	}
-	if _, hasValue := payload["value"]; hasValue {
-		payload["type"] = inferRuntimeRemoteObjectType(payload["value"])
-		return mustMarshal(map[string]interface{}{"result": payload})
-	}
 	return result
+}
+
+func normalizeRuntimeRemoteObjectRaw(value json.RawMessage) json.RawMessage {
+	var object map[string]interface{}
+	if err := json.Unmarshal(value, &object); err != nil {
+		return value
+	}
+	normalizeRuntimeRemoteObject(object)
+	return mustMarshal(object)
+}
+
+func normalizeRuntimeRemoteObject(object map[string]interface{}) {
+	if _, hasType := object["type"]; hasType {
+		return
+	}
+	if _, hasUnserializable := object["unserializableValue"]; hasUnserializable {
+		object["type"] = "number"
+		return
+	}
+	if _, hasObjectID := object["objectId"]; hasObjectID {
+		object["type"] = "object"
+		return
+	}
+	value, hasValue := object["value"]
+	if !hasValue {
+		return
+	}
+	if value == nil {
+		object["type"] = "object"
+		object["subtype"] = "null"
+		return
+	}
+	object["type"] = inferRuntimeRemoteObjectType(value)
 }
 
 func explicitDOMClickRequested(functionDeclaration string) bool {
@@ -97,7 +125,9 @@ func inferRuntimeRemoteObjectType(value interface{}) string {
 	case float64, float32, int, int64, uint64:
 		return "number"
 	case nil:
-		return "undefined"
+		return "object"
+	case map[string]interface{}, []interface{}:
+		return "object"
 	default:
 		return "string"
 	}
@@ -566,7 +596,7 @@ func (b *Bridge) handleRuntime(conn *cdp.Connection, msg *cdp.Message) (json.Raw
 			for _, p := range jugglerProps.Properties {
 				cdpProps = append(cdpProps, map[string]interface{}{
 					"name":         p.Name,
-					"value":        p.Value,
+					"value":        normalizeRuntimeRemoteObjectRaw(p.Value),
 					"configurable": true,
 					"enumerable":   true,
 					"writable":     true,

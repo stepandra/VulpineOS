@@ -17,6 +17,9 @@ function generateId() {
   return 'id-' + (++lastId);
 }
 
+const RUNTIME_CONTEXT_WAIT_TIMEOUT_MS = 750;
+const RUNTIME_CONTEXT_TIMEOUT_CODE = 'ERR_RUNTIME_CONTEXT_TIMEOUT';
+
 const consoleLevelToProtocolType = {
   'dir': 'dir',
   'log': 'log',
@@ -83,19 +86,7 @@ class Runtime {
   }
 
   async evaluate({executionContextId, expression, returnByValue}) {
-    let executionContext;
-    try {
-      executionContext = this.findExecutionContext(executionContextId);
-    } catch (e) {
-      // Fallback: use the most recently created execution context.
-      // This handles races where the context ID becomes stale after navigation.
-      const contexts = this.executionContexts();
-      if (contexts.length > 0) {
-        executionContext = contexts[contexts.length - 1];
-      } else {
-        throw e;
-      }
-    }
+    const executionContext = await this._resolveExecutionContext(executionContextId);
     const exceptionDetails = {};
     let result = await executionContext.evaluateScript(expression, exceptionDetails);
     if (!result)
@@ -106,17 +97,7 @@ class Runtime {
   }
 
   async callFunction({executionContextId, functionDeclaration, args, returnByValue}) {
-    let executionContext;
-    try {
-      executionContext = this.findExecutionContext(executionContextId);
-    } catch (e) {
-      const contexts = this.executionContexts();
-      if (contexts.length > 0) {
-        executionContext = contexts[contexts.length - 1];
-      } else {
-        throw e;
-      }
-    }
+    const executionContext = await this._resolveExecutionContext(executionContextId);
     const exceptionDetails = {};
     let result = await executionContext.evaluateFunction(functionDeclaration, args, exceptionDetails);
     if (!result)
@@ -305,6 +286,48 @@ class Runtime {
     if (!executionContext)
       throw new Error('Failed to find execution context with id = ' + executionContextId);
     return executionContext;
+  }
+
+  async _resolveExecutionContext(executionContextId) {
+    try {
+      return this.findExecutionContext(executionContextId);
+    } catch (e) {
+      const latestContext = this._latestExecutionContext();
+      if (latestContext)
+        return latestContext;
+      return await this._waitForExecutionContext(executionContextId);
+    }
+  }
+
+  _latestExecutionContext() {
+    const contexts = this.executionContexts();
+    return contexts.length ? contexts[contexts.length - 1] : null;
+  }
+
+  async _waitForExecutionContext(requestedExecutionContextId) {
+    const existingContext = this._latestExecutionContext();
+    if (existingContext)
+      return existingContext;
+
+    return await new Promise((resolve, reject) => {
+      let unsubscribe = null;
+      const cleanup = () => {
+        if (unsubscribe)
+          unsubscribe();
+        clearTimeout(timer);
+      };
+      const timer = setTimeout(() => {
+        cleanup();
+        const error = new Error(`${RUNTIME_CONTEXT_TIMEOUT_CODE}: timed out waiting ${RUNTIME_CONTEXT_WAIT_TIMEOUT_MS}ms for execution context after requested id ${requestedExecutionContextId}`);
+        error.code = RUNTIME_CONTEXT_TIMEOUT_CODE;
+        reject(error);
+      }, RUNTIME_CONTEXT_WAIT_TIMEOUT_MS);
+
+      unsubscribe = this.events.onExecutionContextCreated(context => {
+        cleanup();
+        resolve(context);
+      });
+    });
   }
 
   destroyExecutionContext(destroyedContext) {
@@ -508,16 +531,23 @@ class ExecutionContext {
       return {objectId, type: 'symbol'};
     }
 
-    let unserializableValue = undefined;
-    if (Object.is(debuggerObj, NaN))
-      unserializableValue = 'NaN';
-    else if (Object.is(debuggerObj, -0))
-      unserializableValue = '-0';
-    else if (Object.is(debuggerObj, Infinity))
-      unserializableValue = 'Infinity';
-    else if (Object.is(debuggerObj, -Infinity))
-      unserializableValue = '-Infinity';
-    return unserializableValue ? {unserializableValue} : {value: debuggerObj};
+    return this._primitiveToRemoteObject(debuggerObj);
+  }
+
+  _primitiveToRemoteObject(value) {
+    if (Object.is(value, undefined))
+      return {type: 'undefined'};
+    if (Object.is(value, null))
+      return {type: 'object', subtype: 'null', value: null};
+    if (Object.is(value, NaN))
+      return {type: 'number', unserializableValue: 'NaN'};
+    if (Object.is(value, -0))
+      return {type: 'number', unserializableValue: '-0'};
+    if (Object.is(value, Infinity))
+      return {type: 'number', unserializableValue: 'Infinity'};
+    if (Object.is(value, -Infinity))
+      return {type: 'number', unserializableValue: '-Infinity'};
+    return {type: typeof value, value};
   }
 
   ensureSerializedToValue(protocolObject) {
@@ -525,7 +555,7 @@ class ExecutionContext {
       return protocolObject;
     const obj = this._remoteObjects.get(protocolObject.objectId);
     this._remoteObjects.delete(protocolObject.objectId);
-    return {value: this._serialize(obj)};
+    return this._primitiveToRemoteObject(this._serialize(obj));
   }
 
   _toDebugger(obj) {

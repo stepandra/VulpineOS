@@ -80,7 +80,8 @@ export class Dispatcher {
       `);
       this._connection.send(JSON.stringify({id, sessionId, error: {
         message: e.message,
-        data: e.stack
+        data: e.stack,
+        code: e.code,
       }}));
     }
   }
