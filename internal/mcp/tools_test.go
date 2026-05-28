@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -149,6 +150,58 @@ func TestHandleSnapshotProfilesAndRetry(t *testing.T) {
 	}
 }
 
+func TestHandleSnapshotFallsBackToAXTreeWhenOptimizedDOMUnsupported(t *testing.T) {
+	transport := newScriptedJugglerTransport()
+	client := juggler.NewClient(transport)
+	defer client.Close()
+
+	go func() {
+		for {
+			select {
+			case <-transport.closed:
+				return
+			case req := <-transport.outgoing:
+				switch req.Method {
+				case "Page.getOptimizedDOM":
+					transport.incoming <- &juggler.Message{ID: req.ID, Error: &juggler.Error{Message: "method 'Page.getOptimizedDOM' is not supported"}}
+				case "Accessibility.getFullAXTree":
+					transport.incoming <- &juggler.Message{ID: req.ID, Result: json.RawMessage(`{"tree":{"role":"document","name":"Example Domain","children":[{"role":"link","name":"More information"}]}}`)}
+				default:
+					transport.incoming <- &juggler.Message{ID: req.ID, Result: json.RawMessage(`{}`)}
+				}
+			}
+		}
+	}()
+
+	result, err := handleSnapshot(client, json.RawMessage(`{"sessionId":"session-ax-fallback"}`))
+	if err != nil {
+		t.Fatalf("snapshot returned error: %v", err)
+	}
+	if result == nil || result.IsError || len(result.Content) != 1 {
+		t.Fatalf("unexpected result: %#v", result)
+	}
+
+	var payload struct {
+		Fallback string `json:"fallback"`
+		Snapshot struct {
+			Source string          `json:"source"`
+			Nodes  [][]interface{} `json:"nodes"`
+		} `json:"snapshot"`
+	}
+	if err := json.Unmarshal([]byte(result.Content[0].Text), &payload); err != nil {
+		t.Fatalf("unmarshal fallback payload: %v", err)
+	}
+	if payload.Fallback != "Accessibility.getFullAXTree" {
+		t.Fatalf("fallback = %q, want Accessibility.getFullAXTree", payload.Fallback)
+	}
+	if payload.Snapshot.Source != "accessibility" {
+		t.Fatalf("source = %q, want accessibility", payload.Snapshot.Source)
+	}
+	if got := result.Content[0].Text; !strings.Contains(got, "Example Domain") {
+		t.Fatalf("fallback payload missing AX text: %s", got)
+	}
+}
+
 func TestToolSchemaRefTools(t *testing.T) {
 	toolList := tools()
 	toolMap := make(map[string]ToolDefinition)
@@ -266,6 +319,62 @@ func TestHandleNewContextFiltersAttachEventsByBrowserContext(t *testing.T) {
 					transport.incoming <- &juggler.Message{
 						Method: "Browser.attachedToTarget",
 						Params: json.RawMessage(`{"sessionId":"session-new","targetInfo":{"browserContextId":"ctx-new"}}`),
+					}
+					transport.incoming <- &juggler.Message{ID: req.ID, Result: json.RawMessage(`{"targetId":"target-new"}`)}
+				default:
+					transport.incoming <- &juggler.Message{ID: req.ID, Result: json.RawMessage(`{}`)}
+				}
+			}
+		}
+	}()
+
+	result, err := handleNewContext(client, nil)
+	if err != nil {
+		t.Fatalf("handleNewContext returned error: %v", err)
+	}
+	if result == nil || len(result.Content) != 1 {
+		t.Fatalf("unexpected result: %#v", result)
+	}
+
+	var payload struct {
+		ContextID string `json:"contextId"`
+		SessionID string `json:"sessionId"`
+	}
+	if err := json.Unmarshal([]byte(result.Content[0].Text), &payload); err != nil {
+		t.Fatalf("unmarshal result text: %v", err)
+	}
+	if payload.ContextID != "ctx-new" {
+		t.Fatalf("contextId = %q, want ctx-new", payload.ContextID)
+	}
+	if payload.SessionID != "session-new" {
+		t.Fatalf("sessionId = %q, want session-new", payload.SessionID)
+	}
+}
+
+func TestHandleNewContextUsesSingleAttachFallbackWhenContextIDDiffers(t *testing.T) {
+	previousTimeout := newContextAttachTimeout
+	newContextAttachTimeout = 20 * time.Millisecond
+	t.Cleanup(func() {
+		newContextAttachTimeout = previousTimeout
+	})
+
+	transport := newScriptedJugglerTransport()
+	client := juggler.NewClient(transport)
+	defer client.Close()
+
+	go func() {
+		for {
+			select {
+			case <-transport.closed:
+				return
+			case req := <-transport.outgoing:
+				switch req.Method {
+				case "Browser.createBrowserContext":
+					transport.incoming <- &juggler.Message{ID: req.ID, Result: json.RawMessage(`{"browserContextId":"ctx-new"}`)}
+				case "Browser.newPage":
+					transport.incoming <- &juggler.Message{
+						Method: "Browser.attachedToTarget",
+						Params: json.RawMessage(`{"sessionId":"session-new","targetInfo":{"targetId":"target-new","browserContextId":"ctx-reported"}}`),
 					}
 					transport.incoming <- &juggler.Message{ID: req.ID, Result: json.RawMessage(`{"targetId":"target-new"}`)}
 				default:

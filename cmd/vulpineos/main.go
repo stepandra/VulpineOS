@@ -831,6 +831,7 @@ func startRemoteAccessServer(cfg listenConfig, appCfg *config.Config, k *kernel.
 		FoxbridgeRunning: foxbridgeRunning,
 		Client:           client,
 	})
+	wireRemoteJugglerEvents(client, server)
 	wireRemoteAgentEvents(orch, v, server, persistAgentEvents)
 
 	useTLS := !cfg.NoTLS
@@ -897,6 +898,33 @@ func wireRemoteAgentEvents(orch *orchestrator.Orchestrator, v *vault.DB, server 
 			server.BroadcastConversation(msg)
 		}
 	}()
+}
+
+func wireRemoteJugglerEvents(client *juggler.Client, server *remote.Server) {
+	if client == nil || server == nil {
+		return
+	}
+	for _, eventName := range []string{
+		"Browser.attachedToTarget",
+		"Browser.detachedFromTarget",
+		"Page.domContentEventFired",
+		"Page.frameAttached",
+		"Page.frameDetached",
+		"Page.frameNavigated",
+		"Page.frameStoppedLoading",
+		"Page.lifecycleEvent",
+		"Page.loadEventFired",
+		"Runtime.executionContextCreated",
+		"Runtime.executionContextDestroyed",
+		"Runtime.executionContextsCleared",
+		"Target.detachedFromTarget",
+		"Target.targetDestroyed",
+	} {
+		eventName := eventName
+		client.Subscribe(eventName, func(sessionID string, params json.RawMessage) {
+			server.BroadcastEvent(eventName, sessionID, params)
+		})
+	}
 }
 
 // runLocal starts the kernel and TUI locally.

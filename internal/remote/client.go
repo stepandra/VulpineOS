@@ -52,6 +52,7 @@ func Dial(ctx context.Context, url string, apiKey string) (*Client, error) {
 	if err != nil {
 		return nil, fmt.Errorf("dial remote: %w", err)
 	}
+	conn.SetReadLimit(maxWebSocketMessageBytes)
 
 	childCtx, cancel := context.WithCancel(ctx)
 	c := &Client{

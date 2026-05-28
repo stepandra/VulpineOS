@@ -570,6 +570,9 @@ func handleSnapshot(client *juggler.Client, args json.RawMessage) (*ToolCallResu
 
 	result, err := client.Call(p.SessionID, "Page.getOptimizedDOM", params)
 	if err != nil {
+		if isUnsupportedOptimizedDOMError(err) {
+			return handleSnapshotAXFallback(client, p.SessionID, reportedProfile)
+		}
 		return errorResult(err), nil
 	}
 
@@ -601,6 +604,120 @@ func handleSnapshot(client *juggler.Client, args json.RawMessage) (*ToolCallResu
 	}
 
 	return textResult(string(result)), nil
+}
+
+func isUnsupportedOptimizedDOMError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "page.getoptimizeddom") &&
+		(strings.Contains(msg, "not supported") || strings.Contains(msg, "not found") || strings.Contains(msg, "unknown method"))
+}
+
+func handleSnapshotAXFallback(client *juggler.Client, sessionID string, profile snapshotProfile) (*ToolCallResult, error) {
+	axResult, err := client.Call(sessionID, "Accessibility.getFullAXTree", nil)
+	if err != nil {
+		return errorResult(fmt.Errorf("Page.getOptimizedDOM unsupported and AX fallback failed: %w", err)), nil
+	}
+
+	payload, err := buildAXFallbackSnapshot(axResult, profile)
+	if err != nil {
+		return errorResult(fmt.Errorf("Page.getOptimizedDOM unsupported and AX fallback decode failed: %w", err)), nil
+	}
+	return textResult(string(payload)), nil
+}
+
+func buildAXFallbackSnapshot(axResult json.RawMessage, profile snapshotProfile) ([]byte, error) {
+	var raw struct {
+		Nodes []map[string]interface{} `json:"nodes"`
+		Tree  map[string]interface{}   `json:"tree"`
+	}
+	if err := json.Unmarshal(axResult, &raw); err != nil {
+		return nil, err
+	}
+
+	limit := profile.MaxNodes
+	if len(raw.Nodes) == 0 && len(raw.Tree) > 0 {
+		raw.Nodes = flattenAXTree(raw.Tree, limit)
+	}
+	if limit <= 0 || limit > len(raw.Nodes) {
+		limit = len(raw.Nodes)
+	}
+	nodes := make([][]interface{}, 0, limit)
+	for _, node := range raw.Nodes {
+		if len(nodes) >= limit {
+			break
+		}
+		role := axString(node["role"])
+		name := axString(node["name"])
+		if role == "" && name == "" {
+			continue
+		}
+		depth := 0
+		if rawDepth, ok := node["depth"].(float64); ok && rawDepth >= 0 {
+			depth = int(rawDepth)
+		}
+		entry := []interface{}{depth, role, name}
+		if nodeID, ok := node["nodeId"].(string); ok && nodeID != "" {
+			entry = append(entry, map[string]interface{}{"axNodeId": nodeID})
+		}
+		nodes = append(nodes, entry)
+	}
+
+	payload := map[string]interface{}{
+		"snapshot": map[string]interface{}{
+			"v":      1,
+			"title":  "Accessibility fallback snapshot",
+			"url":    "",
+			"source": "accessibility",
+			"nodes":  nodes,
+		},
+		"profile":        profile.Name,
+		"truncated":      len(raw.Nodes) > limit,
+		"fallback":       "Accessibility.getFullAXTree",
+		"fallbackReason": "Page.getOptimizedDOM unsupported by this Camoufox/Juggler build",
+		"retryHint":      "Optimized DOM refs are unavailable in this build; use AX text plus coordinate, search, annotated screenshot, or direct screenshot tools.",
+	}
+	return json.Marshal(payload)
+}
+
+func flattenAXTree(root map[string]interface{}, limit int) []map[string]interface{} {
+	nodes := []map[string]interface{}{}
+	var walk func(map[string]interface{}, int)
+	walk = func(node map[string]interface{}, depth int) {
+		if node == nil || (limit > 0 && len(nodes) >= limit) {
+			return
+		}
+		copyNode := make(map[string]interface{}, len(node)+1)
+		for key, value := range node {
+			if key == "children" {
+				continue
+			}
+			copyNode[key] = value
+		}
+		copyNode["depth"] = float64(depth)
+		nodes = append(nodes, copyNode)
+		children, _ := node["children"].([]interface{})
+		for _, child := range children {
+			childNode, _ := child.(map[string]interface{})
+			walk(childNode, depth+1)
+		}
+	}
+	walk(root, 0)
+	return nodes
+}
+
+func axString(value interface{}) string {
+	switch v := value.(type) {
+	case string:
+		return v
+	case map[string]interface{}:
+		if s, ok := v["value"].(string); ok {
+			return s
+		}
+	}
+	return ""
 }
 
 func handleClick(client *juggler.Client, args json.RawMessage) (*ToolCallResult, error) {
@@ -730,40 +847,79 @@ func handleNewContext(client *juggler.Client, args json.RawMessage) (*ToolCallRe
 		}
 	}()
 
-	// Subscribe to get the sessionID from the attachedToTarget event. Filter by
-	// browserContextId so concurrent target attaches cannot steal this result.
+	type attachEvent struct {
+		SessionID string
+		TargetID  string
+	}
+
+	// Subscribe to get the sessionID from the attachedToTarget event. Prefer an
+	// exact browserContextId match so concurrent target attaches cannot steal this
+	// result. Some Camoufox/Juggler builds report the page session with a
+	// mismatched browserContextId even though Browser.newPage succeeded; retain a
+	// targetId-matched fallback for that compatibility case instead of timing out.
 	sessionCh := make(chan string, 4)
+	fallbackSessionCh := make(chan attachEvent, 8)
 	cancelAttach := client.SubscribeWithCancel("Browser.attachedToTarget", func(_ string, params json.RawMessage) {
 		var ev struct {
 			SessionID  string `json:"sessionId"`
 			TargetInfo struct {
+				TargetID         string `json:"targetId"`
 				BrowserContextID string `json:"browserContextId"`
 			} `json:"targetInfo"`
 		}
 		json.Unmarshal(params, &ev)
-		if ev.SessionID != "" && ev.TargetInfo.BrowserContextID == ctx.BrowserContextID {
+		if ev.SessionID == "" {
+			return
+		}
+		if ev.TargetInfo.BrowserContextID == ctx.BrowserContextID {
 			select {
 			case sessionCh <- ev.SessionID:
 			default:
 			}
+			return
+		}
+		select {
+		case fallbackSessionCh <- attachEvent{SessionID: ev.SessionID, TargetID: ev.TargetInfo.TargetID}:
+		default:
 		}
 	})
 	defer cancelAttach()
 
 	// Create page in context
-	_, err = client.Call("", "Browser.newPage", map[string]interface{}{
+	pageResult, err := client.Call("", "Browser.newPage", map[string]interface{}{
 		"browserContextId": ctx.BrowserContextID,
 	})
 	if err != nil {
 		return errorResult(err), nil
 	}
+	var page struct {
+		TargetID string `json:"targetId"`
+	}
+	_ = json.Unmarshal(pageResult, &page)
 
 	// Wait for session ID from event
 	var sessionID string
 	select {
 	case sessionID = <-sessionCh:
 	case <-time.After(newContextAttachTimeout):
-		return errorResult(fmt.Errorf("timed out waiting for page session")), nil
+		fallbackSessionID := ""
+		for {
+			select {
+			case fallback := <-fallbackSessionCh:
+				if fallback.SessionID != "" && fallback.TargetID != "" && fallback.TargetID == page.TargetID {
+					fallbackSessionID = fallback.SessionID
+				}
+			default:
+				if fallbackSessionID != "" {
+					sessionID = fallbackSessionID
+					break
+				}
+				return errorResult(fmt.Errorf("timed out waiting for page session")), nil
+			}
+			if sessionID != "" {
+				break
+			}
+		}
 	}
 
 	cleanupContext = false
